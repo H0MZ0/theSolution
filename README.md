@@ -45,6 +45,7 @@ X-GNOME-Autostart-enabled=true
 Name=Goinfre Auto Installer
 Comment=Reinstall missing goinfre packages on startup
 EOF
+theSolution
 ```
 
 This installer copies the scripts to `~/.local/` and automatically configures your shell (`.zshrc` / `.bashrc` / `config.fish`):
