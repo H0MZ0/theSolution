@@ -38,7 +38,7 @@ source ~/.zshrc
 mkdir -p ~/.config/autostart && cat << 'EOF' > ~/.config/autostart/goinfre-auto.desktop
 [Desktop Entry]
 Type=Application
-Exec=python3 /home/hakader/.local/goinfre.py --auto
+Exec=python3 $HOME/.local/goinfre.py --auto
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
