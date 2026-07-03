@@ -31,6 +31,7 @@ To install `theSolution` on your account, run:
 ```bash
 git clone https://github.com/H0MZ0/theSolution.git
 cd theSolution
+pip install textual
 chmod +x install.sh
 ./install.sh
 source ~/.zshrc
