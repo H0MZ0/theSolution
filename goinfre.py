@@ -1210,6 +1210,28 @@ if HAS_TEXTUAL:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+def wait_for_internet(timeout: int = 5) -> bool:
+    """Wait for an active internet connection by attempting HTTPS requests."""
+    print(f"[INFO] Waiting for internet connection (timeout up to {timeout} seconds)...")
+    start_time = time.time()
+    urls = [
+        "https://clients3.google.com/generate_204",
+        "https://github.com"
+    ]
+    while time.time() - start_time < timeout:
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "goinfre-pm"})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    if resp.status in (200, 204):
+                        print("[OK] Internet connection is active!")
+                        return True
+            except Exception:
+                pass
+        time.sleep(2)
+    print("[WARN] Internet connection check timed out. Proceeding anyway.")
+    return False
+
 def run_auto_mode():
     print("[INFO] Running goinfre in Auto-Install mode...")
     desired_names = _read_desired_packages()
@@ -1235,6 +1257,8 @@ def run_auto_mode():
     if not to_install:
         print("[OK] All desired packages are already installed.")
         return
+
+    wait_for_internet()
 
     print(f"[INFO] Installing {len(to_install)} package(s) automatically...")
     for pkg in to_install:
