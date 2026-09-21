@@ -53,6 +53,24 @@ This installer copies the scripts to `~/.local/` and automatically configures yo
 2. Appends `~/.local/bin` to your `PATH` so your installed apps are runnable directly.
 3. Creates an auto-start entry to restore your packages on login.
 
+## 🔄 Update an Existing Installation
+
+If you already cloned and installed `theSolution`, update the existing clone instead of cloning it again:
+
+```bash
+cd ~/theSolution
+git pull --ff-only origin main
+python3 -m pip install --user --upgrade textual
+chmod +x install.sh
+./install.sh
+source ~/.zshrc
+theSolution
+```
+
+Use the path to your existing clone if it is not `~/theSolution`. Running `install.sh` again updates `~/.local/goinfre.py` and `~/.local/packages.conf`. The existing autostart entry does not need to be recreated.
+
+Updating the manager does not update applications that are already installed. Reinstall an application from the manager if you want to download its latest configured version.
+
 
 ---
 
