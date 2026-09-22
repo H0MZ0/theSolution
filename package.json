@@ -1,6 +1,6 @@
 {
   "name": "thesolution-pm",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Install Linux applications in goinfre with theSolution terminal package manager",
   "license": "UNLICENSED",
   "repository": {

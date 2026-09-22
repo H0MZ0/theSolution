@@ -21,11 +21,25 @@ DATA = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'th
 CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
 APP = DATA / 'app'
 SETTINGS = CONFIG / 'goinfre/automation.json'
-CACHE = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'thesolution-pm' / socket.gethostname()
 BIN = Path(os.environ.get('THESOLUTION_BIN_DIR', Path.home() / '.local/bin'))
 FILES = ('bootstrap.py', 'goinfre.py', 'packages.conf', 'check_links.py', 'requirements.txt', 'package.json')
 DEFAULTS = {'enabled': True, 'auto_update': True, 'self_update': True, 'interval_hours': 24}
 REMOTE = 'https://raw.githubusercontent.com/H0MZ0/theSolution/'
+
+
+def runtime_directory():
+    """Keep rebuildable dependencies off the quota-limited persistent home."""
+    override = os.environ.get('THESOLUTION_RUNTIME_DIR')
+    if override:
+        return Path(override).expanduser()
+    for base in (Path.home() / 'goinfre', Path('/goinfre') / Path.home().name):
+        if base.is_dir() and os.access(base, os.W_OK):
+            return base / '.thesolution-pm'
+    return Path(tempfile.gettempdir()) / f'thesolution-pm-{os.getuid()}'
+
+
+RUNTIME = runtime_directory()
+CACHE = RUNTIME / 'logs' / socket.gethostname()
 
 
 def read_settings():
@@ -66,7 +80,9 @@ def setup(source=SOURCE, start=True):
     with (DATA / 'setup.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         # Keep a newer self-updated runtime if an older npm installation is launched.
-        if source != APP and version(source) >= version(APP):
+        unchanged = APP.exists() and all((APP / name).is_file() and
+                    (source / name).read_bytes() == (APP / name).read_bytes() for name in FILES)
+        if source != APP and not unchanged and version(source) >= version(APP):
             stage = Path(tempfile.mkdtemp(prefix='app-stage-', dir=DATA))
             backup = DATA / 'app-previous'
             try:
@@ -85,16 +101,19 @@ def setup(source=SOURCE, start=True):
             finally:
                 shutil.rmtree(stage, ignore_errors=True)
         BIN.mkdir(parents=True, exist_ok=True)
-        launcher = BIN / 'thesolution-pm'
+        # Desktop/autostart use a persistent launcher outside npm's bin namespace.
+        launcher = DATA / 'launch'
         # Resolve Python on each machine; the original machine's venv may not exist.
         script = '#!/bin/sh\nexec "${GOINFRE_PYTHON:-python3}" ' + shlex.quote(str(APP / 'bootstrap.py')) + ' "$@"\n'
         atomic_write(launcher, script)
         launcher.chmod(0o755)
-        # Avoid overwriting an npm-owned symlink when npm prefix is ~/.local.
-        alias = BIN / 'theSolution'
-        if not alias.is_symlink():
-            atomic_write(alias, script)
-            alias.chmod(0o755)
+        # npm creates and owns its own bin symlinks. Never replace them with files.
+        # Standalone shell installs get symlinks only when the names are unused.
+        if os.environ.get('npm_lifecycle_event') != 'postinstall':
+            for name in ('thesolution-pm', 'theSolution'):
+                alias = BIN / name
+                if not alias.exists() and not alias.is_symlink():
+                    alias.symlink_to(launcher)
         applications = DATA.parent / 'applications'
         desktop = '[Desktop Entry]\nType=Application\nName=theSolution\nComment=Manage goinfre applications\nExec=' + desktop_arg(launcher) + '\nTerminal=true\nIcon=system-software-install\nCategories=Settings;PackageManager;\n'
         atomic_write(applications / 'thesolution.desktop', desktop)
@@ -284,7 +303,7 @@ def main():
     python = sys.executable
     if not any(flag in args for flag in ('--auto', '-a', '--update')):
         # Host-specific environments avoid broken cross-machine Python symlinks.
-        venv = DATA / 'venvs' / socket.gethostname() / f'python{sys.version_info.major}.{sys.version_info.minor}'
+        venv = RUNTIME / 'venvs' / socket.gethostname() / f'python{sys.version_info.major}.{sys.version_info.minor}'
         python = str(venv / 'bin/python')
         requirement = (APP / 'requirements.txt').read_text().strip().split('==')[1]
         probe = 'import importlib.metadata, sys; sys.exit(importlib.metadata.version("textual") != ' + repr(requirement) + ')'
@@ -292,9 +311,13 @@ def main():
         with (venv.parent / 'setup.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if not Path(python).exists() or subprocess.run([python, '-c', probe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
-                print('Preparing Python environment...', flush=True)
-                subprocess.run([sys.executable, '-m', 'venv', str(venv)], check=True)
-                subprocess.run([python, '-m', 'pip', 'install', '--disable-pip-version-check', '-r', str(APP / 'requirements.txt')], check=True)
+                print(f'Preparing Python environment in {venv}...', flush=True)
+                try:
+                    subprocess.run([sys.executable, '-m', 'venv', str(venv)], check=True)
+                    subprocess.run([python, '-m', 'pip', 'install', '--no-cache-dir', '--disable-pip-version-check', '-r', str(APP / 'requirements.txt')], check=True)
+                except subprocess.CalledProcessError as error:
+                    shutil.rmtree(venv, ignore_errors=True)
+                    raise RuntimeError(f'Python environment setup failed in {venv}. Check free space there and Python venv/ensurepip support. Run again to retry.') from error
     return subprocess.call([python, str(APP / 'goinfre.py'), *args])
 
 

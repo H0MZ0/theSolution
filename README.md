@@ -16,7 +16,7 @@ Without Node/npm:
 ./install.sh
 ```
 
-Both install a persistent copy into `~/.local/share/thesolution-pm/app`, commands in `~/.local/bin`, a **theSolution** applications-menu shortcut, and login maintenance. No sudo is needed. Open the menu shortcut or run:
+Both install a persistent copy into `~/.local/share/thesolution-pm/app`, npm-managed commands (or shell-install symlinks) in `~/.local/bin`, a **theSolution** applications-menu shortcut, and login maintenance. No sudo is needed. Open the menu shortcut or run:
 
 ```sh
 ~/.local/bin/thesolution-pm
@@ -24,7 +24,7 @@ Both install a persistent copy into `~/.local/share/thesolution-pm/app`, command
 
 The desktop shortcut opens the terminal interface. It is not a separate graphical interface. Add `~/.local/bin` to PATH if you want to type `thesolution-pm` or `theSolution` directly. Remove an older `theSolution` shell alias if it still points to the old installer.
 
-Requires **Python 3.11+ with venv/pip**, Linux x86-64, and `dpkg` for DEBs. npm installation additionally needs Node.js 20+. First interactive launch installs Textual into a separate environment for each machine. Python and system libraries must already be available; extraction does not install system dependencies.
+Requires **Python 3.11+ with venv/pip**, Linux x86-64, and `dpkg` for DEBs. npm installation additionally needs Node.js 20+. First interactive launch installs Textual into a separate environment for each machine under `~/goinfre/.thesolution-pm`, `/goinfre/<login>/.thesolution-pm`, or a user-specific directory in `/tmp` if goinfre is unavailable. These environments are recreated if local storage is wiped; they do not consume persistent home quota. Python and system libraries must already be available; extraction does not install system dependencies.
 
 ## Give it to another person
 
@@ -34,13 +34,13 @@ Create the distributable npm package:
 npm pack
 ```
 
-Send `thesolution-pm-1.1.0.tgz`. The recipient installs with one command:
+Send `thesolution-pm-1.1.1.tgz`. The recipient installs with one command:
 
 ```sh
-npm install --global ./thesolution-pm-1.1.0.tgz
+npm install --global ./thesolution-pm-1.1.1.tgz
 ```
 
-The public npm name is **not published yet**. After publishing with your npm account, anyone can use:
+The package is available on npm. Anyone can use:
 
 ```sh
 npx --yes thesolution-pm@latest
@@ -48,15 +48,15 @@ npx --yes thesolution-pm@latest
 npm install --global thesolution-pm
 ```
 
-`goinfre-pm` belongs to a different project. Publishing this package requires `npm login` and then `npm publish`. This environment is not logged into npm.
+`goinfre-pm` belongs to a different project. Maintainers publish new versions of this package with `npm login` and `npm publish`.
 
-After these changes are pushed to this repository's `main` branch, the no-npm one-command installer will also work:
+The no-npm one-command installer is also available:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/H0MZ0/theSolution/main/install.sh | sh
 ```
 
-The remote installer and self-update cannot fetch unpublished local changes. No push or npm publish has been performed.
+The remote installer and self-update use published files from GitHub `main`; they cannot fetch unpublished local changes.
 
 ## Restore and update automatically
 
@@ -69,7 +69,7 @@ Installation enables graphical-login maintenance and starts it for the current s
 
 Applications are downloaded and extracted in a separate directory before replacement. Failed downloads, extraction, or post-install steps preserve the previous installation. Updates need temporary room for the archive, replacement, and previous version. Newer system-library requirements can still prevent an updated app from running.
 
-The manager also checks this project's GitHub `main` branch for a higher package version, downloads all runtime files from one commit, and replaces its persistent copy. Maintainers must increment `package.json` and push the complete release for self-update to see it. Until these changes are published upstream, failed manager checks leave the local copy intact.
+The manager also checks this project's GitHub `main` branch for a higher package version, downloads all runtime files from one commit, and replaces its persistent copy. Maintainers must increment `package.json` and push the complete release for self-update to see it. Failed manager update checks leave the local copy intact.
 
 Across school PCs, your home directory must follow your login, the chosen goinfre path must work there, and Python must be available. A persistent copy means deleting an `npx` cache does not remove the launcher. Python environments are rebuilt per machine as needed. Autostart uses the desktop session; it does not run at an SSH-only login.
 
@@ -99,7 +99,7 @@ thesolution-pm --disable-autostart        # Stop login/background maintenance
 thesolution-pm --enable-autostart
 ```
 
-Preferences are in `~/.config/goinfre/automation.json`; logs are in `~/.cache/thesolution-pm/<hostname>/maintenance.log`. An active installation finishes before a disabled worker exits. Standard XDG directory overrides are supported.
+Preferences are in `~/.config/goinfre/automation.json`; logs are in the runtime directory under `logs/<hostname>/maintenance.log` (use `--status` for the exact path). An active installation finishes before a disabled worker exits. Standard XDG directory overrides are supported.
 
 ## App sources and verification
 
@@ -147,8 +147,21 @@ brave-browser https://github.com/brave/brave-browser#asset=brave-browser_*_amd64
 tor https://aus1.torproject.org/torbrowser/update_3/release/download-linux-x86_64.json#resolve=tor
 ```
 
-Advanced installations can set `GOINFRE_PYTHON` to a Python executable, `THESOLUTION_BIN_DIR` to a different command directory, or `THESOLUTION_NO_START=1` to register login maintenance without starting a worker immediately. `./install.sh --no-start` does the same for shell installation.
+Advanced installations can set `GOINFRE_PYTHON` to a Python executable, `THESOLUTION_BIN_DIR` to a different command directory, `THESOLUTION_RUNTIME_DIR` to a writable location outside your home quota, or `THESOLUTION_NO_START=1` to register login maintenance without starting a worker immediately. `./install.sh --no-start` does the same for shell installation.
 
 ## Credits
 
 Inspired by [Mohamed El Mouhib's Fixgoinfre](https://github.com/Mohamed-El-Mouhib/Fixgoinfre.git) and Achraf Ennadiri's zero-tow project ([GitHub profile](https://github.com/ac-ennadi)). The owner has not selected a license; npm metadata remains `UNLICENSED`.
+
+## Full home storage / npm cache
+
+On school machines, place npm's download cache in goinfre before using npm or npx:
+
+```sh
+mkdir -p "$HOME/goinfre/.cache/npm"
+npm config set cache "$HOME/goinfre/.cache/npm" --location=user
+```
+
+The tool's Python environments and logs already use goinfre (or `/tmp`). npm downloads happen before the tool runs, so npm's own cache location is configured separately. Application lists and the small persistent launcher/runtime remain in your home directory.
+
+Version 1.1.1 also fixes the old installer overwriting npm's executable symlink. If upgrading from 1.1.0 reports `EEXIST`, remove only the old tool-created regular launcher at `~/.local/bin/thesolution-pm` before reinstalling; do not use `--force` to overwrite unrelated commands.
