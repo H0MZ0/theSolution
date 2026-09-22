@@ -1,0 +1,38 @@
+{
+  "name": "thesolution-pm",
+  "version": "1.1.0",
+  "description": "Install Linux applications in goinfre with theSolution terminal package manager",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/H0MZ0/theSolution.git"
+  },
+  "bin": {
+    "thesolution-pm": "bin/thesolution.cjs",
+    "theSolution": "bin/thesolution.cjs"
+  },
+  "files": [
+    "bin/",
+    "bootstrap.py",
+    "goinfre.py",
+    "packages.conf",
+    "check_links.py",
+    "requirements.txt",
+    "install.sh",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "scripts": {
+    "start": "node bin/thesolution.cjs",
+    "check-links": "python3 check_links.py",
+    "postinstall": "node bin/thesolution.cjs --setup"
+  }
+}

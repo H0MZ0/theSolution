@@ -5,7 +5,9 @@ Reads packages.conf and manages packages in a configurable install root.
 """
 
 import argparse, os, sys, json, re, platform, shutil, subprocess, tarfile, zipfile, time
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
+import fnmatch
+import html, gzip, tempfile, fcntl, functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +17,7 @@ from typing import Generator
 DEFAULT_INSTALL_ROOT = Path.home() / "goinfre" / "bin"
 CONF_FILE   = Path(__file__).parent / "packages.conf"
 TMP_DIR     = Path("/tmp/goinfre_install")
-CONFIG_DIR  = Path.home() / ".config" / "goinfre"
+CONFIG_DIR  = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "goinfre"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 STATE_FILE  = CONFIG_DIR / "state.json"
 
@@ -29,16 +31,29 @@ def _read_desired_packages() -> list[str]:
     try:
         data = json.loads(STATE_FILE.read_text())
         return data.get("desired", [])
-    except Exception:
-        return []
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Cannot read saved application list: {error}") from error
 
 def _write_desired_packages(desired: list[str]) -> None:
     """Save the list of desired/previously installed package names."""
-    try:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_json(STATE_FILE, {"desired": sorted(set(desired))})
+
+def atomic_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        json.dump(data, stream, indent=2)
+        temporary = Path(stream.name)
+    temporary.replace(path)
+
+def package_lock(function):
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps({"desired": sorted(list(set(desired)))}, indent=2))
-    except Exception:
-        pass
+        with (CONFIG_DIR / "packages.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield from function(*args, **kwargs)
+    return locked
 
 def _read_config_path() -> Path | None:
     """Read install_root from ~/.config/goinfre/config.toml."""
@@ -88,7 +103,7 @@ class Package:
     @property
     def source_type(self) -> str:
         u = self.url.lower()
-        if re.match(r"https?://github\.com/[^/]+/[^/]+/?$", u):
+        if github_repo_match(u):
             return "GitHub Release"
         for ext in (".appimage",):
             if u.endswith(ext): return "AppImage"
@@ -102,7 +117,7 @@ class Package:
         return self.url.rstrip("/").split("/")[-1].split("?")[0][:30]
 
     def installed(self) -> bool:
-        return (GOINFRE_BIN / self.name).exists()
+        return find_package_executable(GOINFRE_BIN / self.name, self.name) is not None
 
 # ── Config parser ─────────────────────────────────────────────────────────────
 def parse_conf(path: Path) -> list[Package]:
@@ -142,46 +157,169 @@ class DownloadStrategy(ABC):
         """Yield log strings, final yield is the Path to downloaded file."""
         ...
 
-class GitHubReleaseStrategy(DownloadStrategy):
-    def resolve_and_download(self, url: str, name: str, dest: Path) -> Generator[str | Path, None, None]:
-        m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/?$", url)
-        if not m:
-            raise RuntimeError(f"Not a valid GitHub repo URL: {url}")
-        owner, repo = m.group(1), m.group(2)
-        api = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
-        yield f"[INFO] Fetching latest release from {owner}/{repo}..."
-        try:
-            req = urllib.request.Request(api, headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "goinfre-pm"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-        except Exception as e:
-            raise RuntimeError(f"GitHub API error: {e}")
-        assets = data.get("assets", [])
-        if not assets:
-            raise RuntimeError(f"No assets found for {owner}/{repo} latest release")
-        tag = data.get("tag_name", "unknown")
-        yield f"[INFO] Latest release: {tag} ({len(assets)} assets)"
-        os_name, arch_tags = _detect_os_arch()
-        skip_ext = (".sha256", ".sig", ".asc", ".sha512", ".md5", ".txt", ".zsync")
-        scored = []
-        for a in assets:
-            n = a["name"].lower()
-            if any(n.endswith(e) for e in skip_ext):
+def github_repo_match(url: str):
+    return re.fullmatch(r"https?://github\.com/([^/]+)/([^/#?]+)/?", url.split("#", 1)[0])
+
+
+def fetch_json(url: str):
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json", "User-Agent": "goinfre-pm",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"Release metadata request failed for {url}: {e}") from e
+
+
+def select_release_asset(release: dict, pattern: str | None = None) -> dict | None:
+    os_name, arch_tags = _detect_os_arch()
+    candidates = []
+    for asset in release.get("assets", []):
+        name = asset["name"]
+        lower = name.lower()
+        if not lower.endswith((".deb", ".appimage", ".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".zip")):
+            continue
+        if pattern:
+            if not fnmatch.fnmatchcase(name, pattern):
                 continue
-            os_match = os_name in n or "linux" in n
-            arch_match = any(t in n for t in arch_tags)
-            if os_match and arch_match:
-                scored.append((2, a))
-            elif os_match:
-                scored.append((1, a))
-        if not scored:
-            raise RuntimeError(f"No matching asset for {os_name}/{arch_tags} in {owner}/{repo}")
-        scored.sort(key=lambda x: -x[0])
-        chosen = scored[0][1]
-        dl_url = chosen["browser_download_url"]
-        yield f"[INFO] Selected asset: {chosen['name']}"
-        direct = DirectURLStrategy()
-        yield from direct.resolve_and_download(dl_url, name, dest)
+        else:
+            # Never fall back to a different architecture or a source/debug archive.
+            if not any(tag in lower for tag in arch_tags):
+                continue
+            if os_name not in lower and not (os_name == "linux" and lower.endswith((".deb", ".appimage"))):
+                continue
+            if any(tag in lower for tag in ("symbols", "debug", "source")):
+                continue
+        candidates.append(asset)
+    if len(candidates) > 1:
+        raise RuntimeError("Multiple release assets match; specify a unique #asset= filename pattern")
+    return candidates[0] if candidates else None
+
+
+def resolve_download_url(url: str) -> str:
+    """Resolve a GitHub release to an exact asset; leave direct URLs unchanged."""
+    vendor = urllib.parse.parse_qs(urllib.parse.urlsplit(url).fragment).get("resolve")
+    if vendor:
+        return resolve_vendor_url(url.split("#", 1)[0], vendor[0])
+    match = github_repo_match(url)
+    if not match:
+        return url
+    options = urllib.parse.parse_qs(urllib.parse.urlsplit(url).fragment)
+    pattern = options.get("asset", [None])[0]
+    channel = options.get("channel", ["stable"])[0]
+    if channel not in ("stable", "nightly"):
+        raise RuntimeError(f"Unsupported release channel: {channel}")
+    if channel == "nightly" and (not pattern or "nightly" not in pattern):
+        raise RuntimeError("Nightly releases require an explicit nightly asset pattern")
+    base = f"https://api.github.com/repos/{match[1]}/{match[2]}/releases"
+    if channel == "stable":
+        release = fetch_json(base + "/latest")
+        if not release.get("draft") and not release.get("prerelease"):
+            asset = select_release_asset(release, pattern)
+            if asset:
+                return asset["browser_download_url"]
+    # Some projects publish mobile-only releases, or multiple channels in one repo.
+    # Search recent releases for the newest matching desktop/channel asset.
+    for page in range(1, 4):
+        releases = fetch_json(f"{base}?per_page=30&page={page}")
+        for release in releases:
+            if release.get("draft") or (channel == "stable" and release.get("prerelease")):
+                continue
+            asset = select_release_asset(release, pattern)
+            if asset:
+                return asset["browser_download_url"]
+        if len(releases) < 30:
+            break
+    raise RuntimeError(f"No matching {channel} release asset for {url}")
+
+
+def fetch_text(url: str) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": "goinfre-pm"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            data = gzip.decompress(data)
+        return html.unescape(data.decode("utf-8"))
+
+
+def resolve_vendor_url(url: str, vendor: str) -> str:
+    """Read current Linux x86-64 installers from official vendor metadata/pages."""
+    if vendor == "tor":
+        return fetch_json(url)["binary"]
+    if vendor == "go":
+        for release in fetch_json(url):
+            if release.get("stable"):
+                for file in release["files"]:
+                    if (file["os"], file["arch"], file["kind"]) == ("linux", "amd64", "archive"):
+                        return "https://go.dev/dl/" + file["filename"]
+        raise RuntimeError("No stable Go Linux amd64 archive")
+    page = fetch_text(url)
+    if vendor in ("opera", "warp"):
+        package, base = {
+            "opera": ("opera-stable", "https://deb.opera.com/opera-stable/"),
+            "warp": ("warp-terminal", "https://releases.warp.dev/linux/deb/"),
+        }[vendor]
+        candidates = []
+        for paragraph in page.split("\n\n"):
+            fields = dict(line.split(": ", 1) for line in paragraph.splitlines()
+                          if ": " in line and not line.startswith(" "))
+            if fields.get("Package") == package and fields.get("Architecture") == "amd64":
+                candidates.append(fields)
+        if not candidates:
+            raise RuntimeError(f"No {package} amd64 entry in vendor repository")
+        # These vendor versions use dotted numeric components.
+        latest = max(candidates, key=lambda entry: tuple(map(int, re.findall(r"\d+", entry["Version"]))))
+        return urllib.parse.urljoin(base, latest["Filename"])
+    patterns = {
+        "antigravity": r'https://edgedl[^"\s<>]+/antigravity/stable/[^"\s<>]+/linux-x64/[^"\s<>]+\.tar\.gz',
+        "waterfox": r'https://cdn\.waterfox\.com/[^"\s<>]+/Linux_x86_64/[^"\s<>]+\.tar\.bz2',
+        "seamonkey": r'https://archive\.seamonkey-project\.org/releases/[^"\s<>]+/linux-x86_64/en-US/[^"\s<>]+\.tar\.bz2',
+        "sublime": r'https://download\.sublimetext\.com/sublime-text_build-\d+_amd64\.deb',
+        "blender": r'https://www\.blender\.org/download/release/Blender[\d.]+/blender-[\d.]+-linux-x64\.tar\.xz/',
+        "slack": r'https://downloads\.slack-edge\.com/[^"\s<>]+/slack-desktop-[^"\s<>]+-amd64\.deb',
+        "android": r'https://edgedl[^"\s<>]+/android/studio/ide-zips/[^"\s<>]+linux\.tar\.gz',
+    }
+    if vendor not in patterns:
+        raise RuntimeError(f"Unknown release resolver: {vendor}")
+    matches = list(dict.fromkeys(re.findall(patterns[vendor], page)))
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one current {vendor} installer, found {len(matches)}; vendor page may have changed")
+    result = matches[0]
+    if vendor == "blender":
+        result = result.replace("https://www.blender.org/download/release/", "https://download.blender.org/release/").rstrip("/")
+    return result
+
+
+def download_metadata(url: str) -> dict:
+    """Fingerprint the installer without retaining expiring signed redirect URLs."""
+    resolved = resolve_download_url(url)
+    request = urllib.request.Request(resolved, headers={"User-Agent": "goinfre-pm", "Range": "bytes=0-511"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        prefix = response.read(512)
+        if not prefix.startswith((b"!<arch>\n", b"\x1f\x8b", b"\xfd7zXZ\x00", b"BZh", b"PK\x03\x04", b"\x7fELF")):
+            raise RuntimeError("Source did not return an installer/archive")
+        return {
+            "source": url, "resolved_url": resolved,
+            "filename": get_response_filename(response, resolved),
+            "etag": response.headers.get("ETag", ""),
+            "modified": response.headers.get("Last-Modified", ""),
+            "size": response.headers.get("Content-Range", "").split("/")[-1]
+                    or response.headers.get("Content-Length", ""),
+        }
+
+
+def same_release(old: dict, current: dict) -> bool:
+    # All current catalog sources provide versioned filenames or HTTP validators.
+    return all(old.get(key) == current.get(key) for key in ("source", "filename", "etag", "modified", "size"))
+
+
+class GitHubReleaseStrategy(DownloadStrategy):
+    def resolve_and_download(self, url: str, name: str, dest: Path):
+        yield "[INFO] Resolving current GitHub release asset..."
+        dl_url = resolve_download_url(url)
+        yield f"[INFO] Selected asset: {dl_url.rsplit('/', 1)[-1]}"
+        yield from DirectURLStrategy().resolve_and_download(dl_url, name, dest)
 
 def get_response_filename(resp, url: str) -> str:
     # 1. Try Content-Disposition header
@@ -189,11 +327,11 @@ def get_response_filename(resp, url: str) -> str:
     if cd:
         m = re.search(r'filename=["\']?([^"\';]+)["\']?', cd)
         if m:
-            return m.group(1)
+            return Path(urllib.parse.unquote(m.group(1))).name
     # 2. Try the final redirected URL
     final_url = resp.geturl()
     path = urllib.parse.urlparse(final_url).path
-    fname = Path(path).name
+    fname = Path(urllib.parse.unquote(path)).name
     if fname:
         return fname
     # 3. Fallback to original URL
@@ -205,9 +343,12 @@ class DirectURLStrategy(DownloadStrategy):
     def resolve_and_download(self, url: str, name: str, dest: Path) -> Generator[str | tuple | Path, None, None]:
         yield f"[...] Connecting to download source..."
         try:
+            url = resolve_download_url(url)
             import urllib.parse
             req = urllib.request.Request(url, headers={"User-Agent": "goinfre-pm"})
             with urllib.request.urlopen(req, timeout=120) as resp:
+                if resp.headers.get_content_type() in ("text/html", "application/xhtml+xml", "application/json"):
+                    raise RuntimeError("Download URL returned a web page or metadata instead of an installer")
                 fname = get_response_filename(resp, url)
                 out = dest / fname
                 yield f"[...] Downloading {fname}..."
@@ -225,6 +366,9 @@ class DirectURLStrategy(DownloadStrategy):
                         if total > 0:
                             pct = min(downloaded / total * 100, 100)
                             yield ("PROGRESS", pct)
+                if not downloaded or (total and downloaded != total):
+                    out.unlink(missing_ok=True)
+                    raise RuntimeError("Download is empty or incomplete")
         except Exception as e:
             raise RuntimeError(f"Download failed: {e}")
         yield ("PROGRESS", 100.0)
@@ -232,14 +376,14 @@ class DirectURLStrategy(DownloadStrategy):
         yield out  # final yield = path
 
 def pick_strategy(url: str) -> DownloadStrategy:
-    if re.match(r"https?://github\.com/[^/]+/[^/]+/?$", url):
+    if github_repo_match(url):
         return GitHubReleaseStrategy()
     return DirectURLStrategy()
 
 # ── Extract ───────────────────────────────────────────────────────────────────
-USER_BIN_DIR = Path.home() / ".local" / "bin"
-USER_DESKTOP_DIR = Path.home() / ".local" / "share" / "applications"
-USER_ICON_DIR = Path.home() / ".local" / "share" / "icons"
+USER_BIN_DIR = Path(os.environ.get("THESOLUTION_BIN_DIR", Path.home() / ".local/bin"))
+USER_DESKTOP_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "applications"
+USER_ICON_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "icons"
 
 EXEC_FILES = {
     "Motasafi7i": "opt/brave.com/brave-nightly/brave-browser-nightly",
@@ -324,8 +468,8 @@ def find_package_executable(pkg_dir: Path, name: str) -> Path | None:
     # 1. Try our known map with key normalization (to handle user renames)
     aliases = {
         "motasafi7i": "opt/brave.com/brave-nightly/brave-browser-nightly",
-        "brave": "opt/brave.com/brave-nightly/brave-browser-nightly",
-        "brave-browser": "opt/brave.com/brave-nightly/brave-browser-nightly",
+        "brave": "opt/brave.com/brave/brave-browser",
+        "brave-browser": "opt/brave.com/brave/brave-browser",
         "brave-browser-nightly": "opt/brave.com/brave-nightly/brave-browser-nightly",
         "acennadicode": "usr/share/code/bin/code",
         "vscode": "usr/share/code/bin/code",
@@ -340,6 +484,8 @@ def find_package_executable(pkg_dir: Path, name: str) -> Path | None:
         p = pkg_dir / rel_path.lstrip("/")
         if p.exists():
             return p
+    if (pkg_dir / "AppRun").is_file():
+        return pkg_dir / "AppRun"
 
     # 2. Try the default base search
     b = find_binary(pkg_dir, name)
@@ -373,6 +519,11 @@ def find_package_executable(pkg_dir: Path, name: str) -> Path | None:
 
     return None
 
+def desktop_arg(value) -> str:
+    value = ''.join('\\' + c if c in '\\"`$' else c for c in str(value))
+    return '"' + value.replace('\\', '\\\\').replace('%', '%%') + '"'
+
+
 def integrate_package(pkg: Package) -> Log:
     pkg_dir = GOINFRE_BIN / pkg.name
     exe = find_package_executable(pkg_dir, pkg.name)
@@ -390,7 +541,7 @@ def integrate_package(pkg: Package) -> Log:
         sym.symlink_to(exe)
         yield f"[OK] Created symlink: {sym} -> {exe}"
     except Exception as e:
-        yield f"[ERROR] Failed to create symlink: {e}"
+        raise RuntimeError(f"Failed to create symlink: {e}") from e
 
     if pkg.name not in NON_GRAPHICAL_PACKAGES:
         icon_file = find_icon(pkg_dir, pkg.name)
@@ -414,13 +565,13 @@ def integrate_package(pkg: Package) -> Log:
             desktop_file.unlink()
 
         is_term = "true" if pkg.name in TERMINAL_PACKAGES else "false"
-        content = f"[Desktop Entry]\nName={pkg.name}\nComment={pkg.name}\nExec={exe}\nTerminal={is_term}\nIcon={icon_name}\nType=Application\n"
+        content = f"[Desktop Entry]\nName={pkg.name}\nComment={pkg.name}\nExec={desktop_arg(exe)}\nTerminal={is_term}\nIcon={icon_name}\nType=Application\n"
         try:
             desktop_file.write_text(content)
             desktop_file.chmod(0o755)
             yield f"[OK] Created desktop launcher: {desktop_file}"
         except Exception as e:
-            yield f"[ERROR] Failed to create desktop launcher: {e}"
+            raise RuntimeError(f"Failed to create desktop launcher: {e}") from e
 
         try:
             subprocess.run(["update-desktop-database", str(USER_DESKTOP_DIR)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -465,8 +616,8 @@ def deintegrate_package(pkg: Package) -> Log:
             except Exception as e:
                 yield f"[WARN] Could not remove {path}: {e}"
 
-def extract_archive(archive: Path, name: str) -> Log:
-    target = GOINFRE_BIN / name
+def extract_archive(archive: Path, name: str, target: Path | None = None) -> Log:
+    target = target if target is not None else GOINFRE_BIN / name
     target.mkdir(parents=True, exist_ok=True)
     fn = archive.name.lower()
     yield f"[...] Extracting {archive.name}..."
@@ -554,7 +705,7 @@ def find_binary(pkg_dir: Path, name: str) -> Path | None:
     return None
 
 def auto_chmod(pkg_dir: Path, name: str) -> Log:
-    b = find_binary(pkg_dir, name)
+    b = find_package_executable(pkg_dir, name)
     if b:
         b.chmod(b.stat().st_mode | 0o111)
         yield f"[OK] chmod +x {b.relative_to(GOINFRE_BIN)}"
@@ -574,61 +725,81 @@ def run_post_cmd(cmd: str, pkg_dir: Path) -> Log:
     yield "[OK] Post-install done."
 
 # ── Install / Remove orchestrators ────────────────────────────────────────────
-def install_package(pkg: Package):
-    """Yields str log lines and ("PROGRESS", pct) tuples."""
+@package_lock
+def install_package(pkg: Package, metadata: dict | None = None):
+    """Download and extract separately, then replace with rollback on failure."""
     GOINFRE_BIN.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     yield f"[INFO] ━━━ Installing {pkg.name} ━━━"
+    target = GOINFRE_BIN / pkg.name
+    stage = Path(tempfile.mkdtemp(prefix=f".{pkg.name}-stage-", dir=GOINFRE_BIN))
+    backup = stage.with_name(stage.name.replace("-stage-", "-backup-"))
+    switched = False
     try:
-        strat = pick_strategy(pkg.url)
-        downloaded = None
-        for msg in strat.resolve_and_download(pkg.url, pkg.name, TMP_DIR):
-            if isinstance(msg, Path):
-                downloaded = msg
-            elif isinstance(msg, tuple):
-                yield msg  # progress tuple
-            else:
-                yield msg
-        if downloaded is None:
-            raise RuntimeError("Download did not produce a file")
-        yield from extract_archive(downloaded, pkg.name)
-        downloaded.unlink(missing_ok=True)
-        yield f"[...] Cleaned up {downloaded.name}"
-        pkg_dir = GOINFRE_BIN / pkg.name
-        yield from auto_chmod(pkg_dir, pkg.name)
+        record = target / ".thesolution-release.json"
+        if metadata is not None and pkg.installed() and record.exists():
+            if same_release(json.loads(record.read_text()), metadata):
+                yield f"[OK] {pkg.name} was already updated by another worker."
+                return
+        metadata = metadata or download_metadata(pkg.url)
+        with tempfile.TemporaryDirectory(prefix=f"{pkg.name}-", dir=TMP_DIR) as temporary:
+            downloaded = None
+            for message in DirectURLStrategy().resolve_and_download(metadata["resolved_url"], pkg.name, Path(temporary)):
+                if isinstance(message, Path):
+                    downloaded = message
+                else:
+                    yield message
+            if downloaded is None:
+                raise RuntimeError("Download did not produce a file")
+            yield from extract_archive(downloaded, pkg.name, stage)
+        if not find_package_executable(stage, pkg.name) and not pkg.post_cmd:
+            raise RuntimeError(f"No executable found in {pkg.name}; keeping previous installation")
+        if target.exists():
+            target.rename(backup)
+        stage.rename(target)
+        switched = True
         if pkg.post_cmd:
-            yield from run_post_cmd(pkg.post_cmd, pkg_dir)
+            yield from run_post_cmd(pkg.post_cmd, target)
+        if not find_package_executable(target, pkg.name):
+            raise RuntimeError("Post-install did not produce an executable")
+        yield from auto_chmod(target, pkg.name)
         yield from integrate_package(pkg)
-        
-        # Save to desired packages state
+        atomic_json(target / ".thesolution-release.json", metadata)
         desired = _read_desired_packages()
         if pkg.name not in desired:
-            desired.append(pkg.name)
-            _write_desired_packages(desired)
-
+            _write_desired_packages(desired + [pkg.name])
+        shutil.rmtree(backup, ignore_errors=True)
         yield f"[OK] {pkg.name} installed successfully!"
-    except RuntimeError as e:
-        partial = GOINFRE_BIN / pkg.name
-        if partial.exists():
-            shutil.rmtree(partial)
-            yield f"[WARN] Removed partial install at {partial}"
-        yield f"[ERROR] {e}"
-        raise
+    except Exception as error:
+        if switched:
+            shutil.rmtree(target, ignore_errors=True)
+        if backup.exists():
+            backup.rename(target)
+            yield from integrate_package(pkg)
+        elif switched:
+            # Remove launchers for a failed first installation, not user settings.
+            for link in (USER_BIN_DIR / pkg.name, USER_DESKTOP_DIR / f"{pkg.name}.desktop"):
+                link.unlink(missing_ok=True)
+        yield f"[ERROR] {error}"
+        raise RuntimeError(str(error)) from error
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
+@package_lock
 def remove_package(pkg: Package) -> Log:
     d = GOINFRE_BIN / pkg.name
     if d.exists():
         yield f"[...] Removing {pkg.name}..."
         shutil.rmtree(d)
         yield f"[OK] {pkg.name} removed."
-        yield from deintegrate_package(pkg)
-        # Remove from desired packages state
-        desired = _read_desired_packages()
-        if pkg.name in desired:
-            desired.remove(pkg.name)
-            _write_desired_packages(desired)
     else:
         yield f"[WARN] {pkg.name} is not installed."
+    yield from deintegrate_package(pkg)
+    # Forget desired packages even after /goinfre has been wiped.
+    desired = _read_desired_packages()
+    if pkg.name in desired:
+        desired.remove(pkg.name)
+        _write_desired_packages(desired)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1232,55 +1403,65 @@ def wait_for_internet(timeout: int = 5) -> bool:
     print("[WARN] Internet connection check timed out. Proceeding anyway.")
     return False
 
-def run_auto_mode():
-    print("[INFO] Running goinfre in Auto-Install mode...")
-    desired_names = _read_desired_packages()
-    if not desired_names:
-        print("[INFO] No previously selected/installed packages found in state.")
-        return
-
-    print(f"[INFO] Found {len(desired_names)} desired package(s): {', '.join(desired_names)}")
-    pkgs = parse_conf(CONF_FILE)
-    pkg_map = {p.name: p for p in pkgs}
-
-    to_install = []
-    for name in desired_names:
-        if name in pkg_map:
-            pkg = pkg_map[name]
-            if not pkg.installed():
-                to_install.append(pkg)
-            else:
-                print(f"[OK] {name} is already installed.")
-        else:
-            print(f"[WARN] Desired package '{name}' not found in packages.conf.")
-
-    if not to_install:
-        print("[OK] All desired packages are already installed.")
-        return
-
-    wait_for_internet()
-
-    print(f"[INFO] Installing {len(to_install)} package(s) automatically...")
-    for pkg in to_install:
+def run_auto_mode(update: bool = False) -> int:
+    """Restore desired apps, optionally updating installed apps to current releases."""
+    desired = set(_read_desired_packages())
+    if update:
+        desired.update(pkg.name for pkg in parse_conf(CONF_FILE) if pkg.installed())
+    if not desired:
+        print("[OK] No applications selected for restore or update.")
+        return 0
+    packages = {pkg.name: pkg for pkg in parse_conf(CONF_FILE)}
+    failures = 0
+    for name in sorted(desired):
+        pkg = packages.get(name)
+        if pkg is None:
+            print(f"[WARN] {name} is missing from the catalog.")
+            continue
         try:
-            for msg in install_package(pkg):
-                if isinstance(msg, str):
-                    print(msg)
-        except Exception as e:
-            print(f"[ERROR] Failed to automatically install {pkg.name}: {e}")
+            metadata = None
+            if pkg.installed():
+                if not update:
+                    for line in integrate_package(pkg):
+                        print(line)
+                    continue
+                metadata = download_metadata(pkg.url)
+                record = GOINFRE_BIN / name / ".thesolution-release.json"
+                previous = json.loads(record.read_text()) if record.exists() else {}
+                if same_release(previous, metadata):
+                    print(f"[OK] {name} is current.")
+                    for line in integrate_package(pkg):
+                        print(line)
+                    continue
+                print(f"[INFO] Updating {name}...")
+            for message in install_package(pkg, metadata):
+                if isinstance(message, str):
+                    print(message)
+        except Exception as error:
+            failures += 1
+            print(f"[ERROR] {name}: {error}")
+    return 1 if failures else 0
 
 def main():
-    global GOINFRE_BIN
+    global GOINFRE_BIN, CONF_FILE
     parser = argparse.ArgumentParser(description="goinfre — Terminal Package Manager")
     parser.add_argument("--install-root", type=str, default=None,
                         help="Override install root path (default: ~/goinfre/bin)")
+    parser.add_argument("--config", type=Path, default=CONF_FILE,
+                        help="Use a custom packages.conf (default: bundled catalog)")
     parser.add_argument("-a", "--auto", action="store_true",
                         help="Automatically check and install previously selected packages")
+    parser.add_argument("--update", action="store_true", help="Restore missing apps and update installed apps")
     args = parser.parse_args()
+    CONF_FILE = args.config.expanduser().resolve()
+    if not CONF_FILE.is_file():
+        parser.error(f"Catalog not found: {CONF_FILE}")
     GOINFRE_BIN = resolve_install_root(args.install_root)
+    if args.install_root:
+        _write_config_path(GOINFRE_BIN)
 
-    if args.auto:
-        run_auto_mode()
+    if args.auto or args.update:
+        sys.exit(run_auto_mode(update=args.update))
     else:
         if not HAS_TEXTUAL:
             print("Install textual first:  pip install textual")
